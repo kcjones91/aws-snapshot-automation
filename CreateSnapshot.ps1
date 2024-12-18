@@ -1,97 +1,164 @@
 param(
+    [string]$InstanceIP,
     [string]$VolumeId,
     [string]$SnapshotName,
     [string]$Description
 )
 
 # Validate Inputs
-if (-not $VolumeId -or -not $SnapshotName -or -not $Description) {
-    Write-Output "Usage: .\CreateSnapshot.ps1 -VolumeId <VolumeId> -SnapshotName <Name> -Description <Description>"
+if (-not $SnapshotName -or -not $Description) {
+    Write-Output "Usage: .\CreateSnapshot.ps1 -SnapshotName <Name> -Description <Description> [-InstanceIP <IP Address>] [-VolumeId <VolumeId>]"
     exit 1
 }
 
-# Take Snapshot
-Write-Output "Creating snapshot for volume ID: $VolumeId with description: '$Description'..."
-try {
-    $snapshot = New-EC2Snapshot -VolumeId $VolumeId -Description $Description
-    
-    if ($null -eq $snapshot) {
-        Write-Output "Failed to create snapshot. Please check the volume ID and permissions."
-        exit 1
-    }
-    
-    $snapshotId = $snapshot.SnapshotId
-    Write-Output "Snapshot created successfully with ID: $snapshotId"
-} catch {
-    Write-Output "Error creating snapshot: $_"
+if (-not $InstanceIP -and -not $VolumeId) {
+    Write-Output "You must provide either -InstanceIP or -VolumeId."
     exit 1
 }
 
-# Monitor Snapshot Progress
-Write-Output "Monitoring progress of snapshot: $snapshotId..."
-try {
-    do {
-        Start-Sleep -Seconds 5
+# Initialize summary list
+$SnapshotSummary = @()
 
-        $SnapshotStatus = Get-EC2Snapshot -SnapshotId $snapshotId
-        $Progress = $SnapshotStatus.Progress
-        $State = $SnapshotStatus.State
-
-        Write-Output "Snapshot Progress: $Progress, State: $State"
-    } while ($State -ne "completed")
-    
-    Write-Output "Snapshot $snapshotId completed successfully!"
-} catch {
-    Write-Output "Error monitoring snapshot: $_"
-    exit 1
-}
-
-# Get Instance Attached to the Volume
-Write-Output "Retrieving the EC2 instance associated with the volume ID: $VolumeId..."
-try {
-    $Volume = Get-EC2Volume -VolumeId $VolumeId
-    $InstanceId = $Volume.Attachments[0].InstanceId
-
-    if (-not $InstanceId) {
-        Write-Output "No EC2 instance found attached to the volume."
-    } else {
-        Write-Output "EC2 instance ID associated with the volume: $InstanceId"
-    }
-} catch {
-    Write-Output "Error retrieving instance details: $_"
-    exit 1
-}
-
-# Copy Tags from Instance to Snapshot
-if ($InstanceId) {
-    Write-Output "Retrieving tags from EC2 instance: $InstanceId..."
+# Snapshot a Single Volume
+if ($VolumeId) {
+    Write-Output "Creating snapshot for volume ID: $VolumeId with description: '$Description'..."
     try {
-        $InstanceTags = Get-EC2Tag -Filter @{Name="resource-id"; Values=$InstanceId}
+        $Snapshot = New-EC2Snapshot -VolumeId $VolumeId -Description $Description
 
-        if ($InstanceTags) {
-            Write-Output "Copying tags from instance to snapshot..."
-            foreach ($Tag in $InstanceTags) {
-                New-EC2Tag -Resource $snapshotId -Tags @{Key=$Tag.Key; Value=$Tag.Value}
-            }
-            Write-Output "Tags copied successfully from instance to snapshot."
-        } else {
-            Write-Output "No tags found on the instance to copy."
+        if ($null -eq $Snapshot) {
+            Write-Output "Failed to create snapshot for volume: $VolumeId."
+            exit 1
+        }
+
+        $SnapshotId = $Snapshot.SnapshotId
+        Write-Output "Snapshot created successfully for volume $VolumeId with ID: $SnapshotId"
+
+        # Monitor Snapshot Progress
+        Write-Output "Monitoring progress of snapshot: $SnapshotId..."
+        do {
+            Start-Sleep -Seconds 5
+            $SnapshotStatus = Get-EC2Snapshot -SnapshotId $SnapshotId
+            $Progress = $SnapshotStatus.Progress
+            $State = $SnapshotStatus.State
+            Write-Output "Snapshot Progress: $Progress%, State: $State"
+        } while ($State -ne "completed")
+
+        Write-Output "Snapshot $SnapshotId for volume $VolumeId completed successfully!"
+
+        # Add Snapshot Name Tag
+        New-EC2Tag -Resource $SnapshotId -Tags @{Key="Name"; Value=$SnapshotName}
+        Write-Output "Name tag added to snapshot: $SnapshotName"
+
+        # Add to summary
+        $SnapshotSummary += @{
+            VolumeId = $VolumeId
+            SnapshotId = $SnapshotId
+            Status = "Completed"
         }
     } catch {
-        Write-Output "Error copying tags: $_"
+        Write-Output "Error creating snapshot for volume ${VolumeId}: $_"
+    }
+    exit 0
+}
+
+# Search Instance by IP to Get Attached Volumes
+if ($InstanceIP) {
+    Write-Output "Searching for EC2 instance with IP address: $InstanceIP..."
+    try {
+        $Instance = Get-EC2Instance -Filter @{Name="private-ip-address"; Values=$InstanceIP} |
+                    Select-Object -ExpandProperty Instances
+
+        if (-not $Instance) {
+            Write-Output "No instance found with IP address: $InstanceIP."
+            exit 1
+        }
+
+        $InstanceId = $Instance.InstanceId
+        Write-Output "Found EC2 instance: $InstanceId"
+
+        # Retrieve all attached EBS volumes
+        $Volumes = $Instance.BlockDeviceMappings | Where-Object { $_.Ebs.VolumeId } | Select-Object -ExpandProperty Ebs
+        if (-not $Volumes) {
+            Write-Output "No EBS volumes found attached to the instance."
+            exit 1
+        }
+        Write-Output "Found $($Volumes.Count) attached EBS volumes."
+    } catch {
+        Write-Output "Error searching for instance: $_"
         exit 1
     }
+
+    # Loop Through Each Volume and Take Snapshots
+    foreach ($Volume in $Volumes) {
+        $VolumeId = $Volume.VolumeId
+        Write-Output "Creating snapshot for volume ID: $VolumeId with description: '$Description'..."
+        try {
+            $Snapshot = New-EC2Snapshot -VolumeId $VolumeId -Description "$Description - Volume: $VolumeId"
+
+            if ($null -eq $Snapshot) {
+                Write-Output "Failed to create snapshot for volume: $VolumeId."
+                $SnapshotSummary += @{
+                    VolumeId = $VolumeId
+                    SnapshotId = "N/A"
+                    Status = "Failed"
+                }
+                continue
+            }
+
+            $SnapshotId = $Snapshot.SnapshotId
+            Write-Output "Snapshot created successfully for volume $VolumeId with ID: $SnapshotId"
+
+            # Monitor Snapshot Progress
+            Write-Output "Monitoring progress of snapshot: $SnapshotId..."
+            do {
+                Start-Sleep -Seconds 5
+                $SnapshotStatus = Get-EC2Snapshot -SnapshotId $SnapshotId
+                $Progress = $SnapshotStatus.Progress
+                $State = $SnapshotStatus.State
+                Write-Output "Snapshot Progress: $Progress%, State: $State"
+            } while ($State -ne "completed")
+
+            Write-Output "Snapshot $SnapshotId for volume $VolumeId completed successfully!"
+
+            # Copy Tags from Instance to Snapshot
+            Write-Output "Retrieving tags from EC2 instance: $InstanceId..."
+            $InstanceTags = Get-EC2Tag -Filter @{Name="resource-id"; Values=$InstanceId}
+            if ($InstanceTags) {
+                foreach ($Tag in $InstanceTags) {
+                    New-EC2Tag -Resource $SnapshotId -Tags @{Key=$Tag.Key; Value=$Tag.Value}
+                }
+                Write-Output "Tags copied successfully from instance to snapshot $SnapshotId."
+            }
+
+            # Add Snapshot Name Tag
+            New-EC2Tag -Resource $SnapshotId -Tags @{Key="Name"; Value="$SnapshotName - $VolumeId"}
+            Write-Output "Name tag added to snapshot: $SnapshotName - $VolumeId"
+
+            # Add to summary
+            $SnapshotSummary += @{
+                VolumeId = $VolumeId
+                SnapshotId = $SnapshotId
+                Status = "Completed"
+            }
+        } catch {
+            Write-Output "Error creating snapshot for volume ${VolumeId}: $_"
+            $SnapshotSummary += @{
+                VolumeId = $VolumeId
+                SnapshotId = "N/A"
+                Status = "Failed"
+            }
+        }
+    }
+
+    Write-Output "All snapshots for instance $InstanceId have been completed."
 }
 
-# Add Snapshot Name Tag
-Write-Output "Adding Name tag to snapshot: $snapshotId..."
-try {
-    New-EC2Tag -Resource $snapshotId -Tags @{Key="Name";Value=$SnapshotName}
-    Write-Output "Name tag added successfully: Name = $SnapshotName"
-} catch {
-    Write-Output "Error adding Name tag: $_"
-    exit 1
+# Display Snapshot Summary
+Write-Output "`nSnapshot Summary:"
+if ($SnapshotSummary.Count -eq 0) {
+    Write-Output "No snapshots were created."
+} else {
+    $SnapshotSummary | ForEach-Object {
+        Write-Output "Volume ID: $($_.VolumeId) | Snapshot ID: $($_.SnapshotId) | Status: $($_.Status)"
+    }
 }
-
-# Final Confirmation
-Write-Output "Snapshot ID: $snapshotId, Description: '$Description', Tag: 'Name=$SnapshotName'"
